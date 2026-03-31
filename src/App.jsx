@@ -15,8 +15,7 @@ import {
     DialogHeader,
     DialogTitle,
 } from "./components/ui/dialog";
-
-const API_URL = import.meta.env.VITE_API_URL;
+import { API_URL, BACKEND_URL } from './config';
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
@@ -1002,7 +1001,7 @@ function App() {
         };
 
         try {
-            const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
+            // BACKEND_URL imported from config.js
             const response = await fetch(`${BACKEND_URL}/tickets/send`, {
                 method: 'POST',
                 headers: {

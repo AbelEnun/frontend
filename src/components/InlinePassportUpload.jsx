@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { Scan, Camera, Upload, Loader2, CheckCircle2, AlertCircle, FileText } from 'lucide-react';
 
-const API_URL = import.meta.env.VITE_API_URL;
+import { API_URL } from '../config';
 
 async function scanPassportWithAI(file) {
   return new Promise((resolve, reject) => {

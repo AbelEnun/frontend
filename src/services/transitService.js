@@ -3,7 +3,7 @@
  * Handles checking layover permissions and filtering flights based on passport restrictions
  */
 
-const LAYOVER_API_URL = import.meta.env.VITE_LAYOVER_API_URL || 'https://jowly-microseismic-keira.ngrok-free.dev/check';
+import { LAYOVER_API_URL } from '../config';
 
 /**
  * Check layover permission for a specific country and passport
