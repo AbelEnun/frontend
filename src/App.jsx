@@ -15,7 +15,8 @@ import {
     DialogHeader,
     DialogTitle,
 } from "./components/ui/dialog";
-import { API_URL, BACKEND_URL } from './config';
+
+const API_URL = import.meta.env.VITE_API_URL;
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
@@ -60,7 +61,7 @@ const ETHIOPIA_TOUR = {
         from: 'March 17, 2026',
         to: 'July 31, 2026',
     },
-    contact: 'An Ethiopian Holidays representative will meet and assist the traveler.',
+    contact: 'A Simba Trip representative will meet and assist the traveler.',
 };
 
 const getPricePerPerson = (numTravelers) => {
@@ -541,7 +542,7 @@ function App() {
 
         const confirmMsg = {
             role: 'assistant',
-            content: `Your tour is booked! 🎉 Confirmation sent to ${email || 'your email'}.\n\nAn Ethiopian Holidays representative will meet and assist you on arrival. Have a wonderful trip! ✨`,
+            content: `Your tour is booked! 🎉 Confirmation sent to ${email || 'your email'}.\n\nA Simba Trip representative will meet and assist you on arrival. Have a wonderful trip! ✨`,
             type: 'booking_confirmed',
             isTour: true,
             bookingRef: bookingRef,
@@ -1001,7 +1002,7 @@ function App() {
         };
 
         try {
-            // BACKEND_URL imported from config.js
+            const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000';
             const response = await fetch(`${BACKEND_URL}/tickets/send`, {
                 method: 'POST',
                 headers: {

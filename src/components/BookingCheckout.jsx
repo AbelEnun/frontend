@@ -4,7 +4,6 @@ import {
   Shield, CreditCard, User, Mail, Phone, ChevronRight, AlertCircle
 } from 'lucide-react';
 import ManualPaymentForm from './ManualPaymentForm';
-import { API_URL } from '../config';
 
 /* ─────────────────────────────────────────────
    Minimal field component
@@ -77,6 +76,7 @@ const Steps = ({ current }) => (
 /* ─────────────────────────────────────────────
    Passport OCR via Lambda
 ───────────────────────────────────────────── */
+const API_URL = import.meta.env.VITE_API_URL;
 
 async function scanPassportWithAI(file) {
   return new Promise((resolve, reject) => {
