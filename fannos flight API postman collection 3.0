@@ -1,0 +1,381 @@
+{
+	"info": {
+		"_postman_id": "334fa30b-ccec-4bda-b4b3-b66805299b02",
+		"name": "Fannos Flight API Flow Hold Booking",
+		"description": "Interconnected flight booking flow with a centralized baseUrl variable.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "22865650"
+	},
+	"item": [
+		{
+			"name": "Hold Path",
+			"item": [
+				{
+					"name": "1. Get Guest Token",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"const response = pm.response.json();",
+									"if (response.guestToken) {",
+									"    pm.collectionVariables.set(\"guestToken\", response.guestToken);",
+									"    console.log(\"Token saved: \" + response.guestToken);",
+									"}"
+								],
+								"type": "text/javascript",
+								"packages": {},
+								"requests": {}
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/auth/guest-token",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"auth",
+								"guest-token"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "2. Flight Shopping",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"const response = pm.response.json();",
+									"// console.log(response, response.data, response.data.qrFlights);",
+									"if (response.data && response.data.qrFlights) {",
+									"    const recommendedOffer = response.data.qrFlights.recommendedOffer",
+									"    pm.collectionVariables.set(\"fareId\", recommendedOffer.offerId);",
+									"    pm.collectionVariables.set(\"provider\", recommendedOffer.provider);",
+									"    pm.collectionVariables.set(\"ITINERARYIDLIST\", JSON.stringify(recommendedOffer.flights.map(flight => flight.productId)));",
+									"}"
+								],
+								"type": "text/javascript",
+								"packages": {},
+								"requests": {}
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"originDestinations\": [\n        {\n            \"departure\": {\n                \"airportCode\": \"FRA\",\n                \"date\": \"2026-02-18\"\n            },\n            \"arrival\": {\n                \"airportCode\": \"DXB\"\n            }\n        },\n        {\n            \"departure\": {\n                \"airportCode\": \"DXB\",\n                \"date\": \"2026-03-10\"\n            },\n            \"arrival\": {\n                \"airportCode\": \"FRA\"\n            }\n        }\n    ],\n    \"travellers\": {\n        \"adt\": 1,\n        \"chd\": 0,\n        \"inf\": 0\n    },\n    \"preference\": {\n        \"cabinPreferences\": {\n            \"cabinType\": {\n                \"code\": \"economy\"\n            }\n        }\n    }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/flight/shopping",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"flight",
+								"shopping"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "3. Offer Price",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"const response = pm.response.json();",
+									"if (response.data.executionId) {",
+									"    pm.collectionVariables.set(\"executionId\", response.data.executionId);",
+									"    pm.collectionVariables.set(\"fareId\", response.data.id);",
+									"}"
+								],
+								"type": "text/javascript",
+								"packages": {},
+								"requests": {}
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"executionId\": \"{{fareId}}\",\n    \"provider\": \"{{provider}}\",\n    \"metadata\": {\n        \"country\": \"ET\",\n        \"currency\": \"USD\",\n        \"locale\": \"en-US\",\n        \"user\": \"tadesse@flocash.com\",\n        \"traceId\": null\n    },\n    \"offerItems\": [\n        {\n            \"offerId\": \"{{fareId}}\",\n            \"offerItemId\": null,\n            \"owner\": \"CP\",\n            \"baggageAllowance\": [\n                {\n                    \"baggageAllowanceId\": null,\n                    \"typeCode\": \"Checked Bag\",\n                    \"totalQuantity\": 1,\n                    \"description\": \"2 PC\"\n                }\n            ],\n            \"baseAmount\": 488,\n            \"taxAmount\": 199.07,\n            \"totalAmount\": 693.07,\n            \"currency\": \"EUR\"\n        }\n    ],\n    \"travellers\": {\n        \"adt\": 1,\n        \"chd\": 0,\n        \"inf\": 0,\n        \"ins\": 0,\n        \"unn\": 0\n    },\n    \"originDestinations\": [\n        {\n            \"departure\": {\n                \"airportCode\": \"JNB\",\n                \"date\": \"2026-01-12\"\n            },\n            \"arrival\": {\n                \"airportCode\": \"DXB\"\n            }\n        },\n        {\n            \"departure\": {\n                \"airportCode\": \"DXB\",\n                \"date\": \"2026-01-28\"\n            },\n            \"arrival\": {\n                \"airportCode\": \"JNB\"\n            }\n        }\n    ],\n    \"fareId\": \"{{fareId}}\",\n    \"itineraryIdList\": {{itineraryIdList}}\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/flight/offer-price",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"flight",
+								"offer-price"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "4. Flight Hold",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"bookingHold\": true,\n    \"executionId\": \"{{executionId}}\",\n    \"offerPriceId\": \"{{executionId}}\",\n    \"provider\": \"{{provider}}\",\n    \"offerItems\": [\n        {\n            \"offerId\": \"{{executionId}}\",\n            \"offerItemId\": \"OFFERITEM-1766751028567\",\n            \"owner\": \"SA\",\n            \"baggageAllowance\": [],\n            \"baseAmount\": 513,\n            \"taxAmount\": 0,\n            \"totalAmount\": 700.88,\n            \"currency\": \"EUR\",\n            \"passengerId\": [\n                \"PAX1\"\n            ],\n            \"paxRefID\": [\n                \"PAX1\"\n            ],\n            \"serviceDefinition\": [\n                {\n                    \"serviceID\": \"SV001\"\n                },\n                {\n                    \"serviceID\": \"SV002\"\n                }\n            ]\n        }\n    ],\n    \"customerInfos\": [\n        {\n            \"gender\": \"MALE\",\n            \"birthDate\": \"1999-07-03\",\n            \"phoneNo\": \"2778784564156\",\n            \"firstName\": \"first middle\",\n            \"lastName\": \"last \",\n            \"middleName\": \"\",\n            \"country\": \"ZA\",\n            \"passPort\": \"54564456\",\n            \"title\": \"Mr\",\n            \"email\": \"first@gmail.com\",\n            \"notify\": true,\n            \"paxType\": \"ADT\",\n            \"paxId\": \"PAX1\",\n            \"accountNumber\": \"\",\n            \"depBarcodeImage\": \"\",\n            \"retBarcodeImage\": \"\",\n            \"depBarcodeCid\": \"\",\n            \"retBarcodeCid\": \"\"\n        }\n    ],\n    \"travellers\": {\n        \"adt\": 1,\n        \"chd\": 0,\n        \"inf\": 0,\n        \"ins\": 0,\n        \"unn\": 0\n    },\n    \"verifyRequest\": {\n        \"fareId\": \"{{fareId}}\",\n        \"itineraryIdList\": {{itineraryIdList}}\n    }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/flight/hold",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"flight",
+								"hold"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Ticketing Path",
+			"item": [
+				{
+					"name": "5. Get payment Options",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"const response = pm.response.json();\r",
+									"\r",
+									"if(response.data.id){\r",
+									"    pm.collectionVariables.set(\"bookingLocator\", response.data.id);\r",
+									"}\r",
+									"if (\r",
+									"    response?.data?.paymentOptions?.cards &&\r",
+									"    Array.isArray(response.data.paymentOptions.cards) &&\r",
+									"    response.data.paymentOptions.cards.length > 0\r",
+									") {\r",
+									"    const cardOption = response.data.paymentOptions.cards[0];\r",
+									"\r",
+									"    pm.collectionVariables.set(\"cardPaymentAvailable\", true);\r",
+									"    pm.collectionVariables.set(\"cardPaymentId\", cardOption.id);\r",
+									"} else {\r",
+									"    pm.collectionVariables.set(\"cardPaymentAvailable\", false);\r",
+									"    pm.collectionVariables.unset(\"cardPaymentId\");\r",
+									"}"
+								],
+								"type": "text/javascript",
+								"packages": {},
+								"requests": {}
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"bookingHold\": true,\n    \"executionId\": \"{{executionId}}\",\n    \"offerPriceId\": \"{{fareId}}\",\n    \"provider\": \"{{provider}}\",\n    \"offerItems\": [\n        {\n            \"offerId\": \"{{fareId}}\",\n            \"offerItemId\": \"OFFERITEM-1766751028567\",\n            \"owner\": \"SA\",\n            \"baggageAllowance\": [],\n            \"baseAmount\": 513,\n            \"taxAmount\": 0,\n            \"totalAmount\": 700.88,\n            \"currency\": \"EUR\",\n            \"passengerId\": [\n                \"PAX1\"\n            ],\n            \"paxRefID\": [\n                \"PAX1\"\n            ],\n            \"serviceDefinition\": [\n                {\n                    \"serviceID\": \"SV001\"\n                },\n                {\n                    \"serviceID\": \"SV002\"\n                }\n            ]\n        }\n    ],\n    \"customerInfos\": [\n        {\n            \"gender\": \"MALE\",\n            \"birthDate\": \"1999-07-03\",\n            \"phoneNo\": \"2778784564156\",\n            \"firstName\": \"Brad\",\n            \"lastName\": \"Pit\",\n            \"middleName\": \"\",\n            \"country\": \"ZA\",\n            \"passPort\": \"54564456\",\n            \"title\": \"Mr\",\n            \"email\": \"brad.test@gmail.com\",\n            \"notify\": true,\n            \"paxType\": \"ADT\",\n            \"paxId\": \"PAX1\",\n            \"accountNumber\": \"\",\n            \"depBarcodeImage\": \"\",\n            \"retBarcodeImage\": \"\",\n            \"depBarcodeCid\": \"\",\n            \"retBarcodeCid\": \"\"\n        }\n    ],\n    \"travellers\": {\n        \"adt\": 1,\n        \"chd\": 0,\n        \"inf\": 0,\n        \"ins\": 0,\n        \"unn\": 0\n    },\n    \"verifyRequest\": {\n        \"fareId\": \"{{fareId}}\",\n        \"itineraryIdList\": {{itineraryIdList}}\n    }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/flight/hold/get-payment-options",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"flight",
+								"hold",
+								"get-payment-options"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "6. Confirm Booking",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"bookingLocator\": \"{{bookingLocator}}\",\n    \"payOption\": {\n        \"id\": {{cardPaymentId}}\n    },\n    \"isCardMethod\": true,\n    \"cardInfo\": {\n        \"cardHolder\": \"JOHN DOE\",\n        \"cardNumber\": \"4444333322221111\",\n        \"expireMonth\": \"12\",\n        \"expireYear\": \"28\",\n        \"cvv\": \"123\"\n    }\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/flight/hold/confirmpayment",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"flight",
+								"hold",
+								"confirmpayment"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "7. 3DS enabled Booking ticketing",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"status\": \"0001\",\n    \"traceNumber\": \"Tr\",\n    \"txnref\": \"txref\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/flight/hold/payment-callback",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"flight",
+								"hold",
+								"payment-callback"
+							]
+						}
+					},
+					"response": []
+				}
+			],
+			"description": "Ticketing path will start just after verify fare, and endpoint number 4 will be skipped and ticketing path will continue"
+		}
+	],
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{
+				"key": "token",
+				"value": "{{guestToken}}",
+				"type": "string"
+			}
+		]
+	},
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"requests": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"requests": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://3.11.26.231/fannos"
+		},
+		{
+			"key": "guestToken",
+			"value": ""
+		},
+		{
+			"key": "fareId",
+			"value": "988ae72f-7bdb-43d5-bc81-3663ea612436"
+		},
+		{
+			"key": "itineraryIdList",
+			"value": "[\"1964ed6e-0be6-4f09-bc9a-37431122f89a\",\"d9c18e91-db7e-42a5-9aa4-94fb947d36f3\"]"
+		},
+		{
+			"key": "executionId",
+			"value": "01e9c6b4-70f9-4033-9695-10c38ad44404"
+		},
+		{
+			"key": "provider",
+			"value": ""
+		},
+		{
+			"key": "bookingLocator",
+			"value": ""
+		},
+		{
+			"key": "cardPaymentId",
+			"value": ""
+		},
+		{
+			"key": "cardPaymentAvailable",
+			"value": ""
+		},
+		{
+			"key": "ITINERARYIDLIST",
+			"value": ""
+		}
+	]
+}

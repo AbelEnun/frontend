@@ -1,0 +1,1465 @@
+import json
+import boto3
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta
+from decimal import Decimal
+import time
+import traceback
+from boto3.dynamodb.conditions import Key
+
+# ----------------------
+# AWS Initialization
+# ----------------------
+BEDROCK_REGION = "eu-north-1"
+INFERENCE_PROFILE_ARN = (
+    "arn:aws:bedrock:eu-north-1:847410060944:inference-profile/"
+    "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+)
+
+dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+flights_table = dynamodb.Table("FlightsCache")
+chat_table = dynamodb.Table("ChatHistory")
+bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+
+# ----------------------
+# API Configuration
+# ----------------------
+BASE_URL = "http://3.11.26.231/fannos"
+LAYOVER_API_URL = "https://nondeliriously-quartus-allena.ngrok-free.dev/check"
+# ----------------------
+# Helpers
+# ----------------------
+def check_layover_permission(country, passport, duration=None):
+    """
+    Query the Layover Permission API for transit rules.
+    """
+    url = f"{LAYOVER_API_URL}?country={urllib.parse.quote(str(country))}&passport={urllib.parse.quote(str(passport))}"
+    if duration:
+        url += f"&layover_hours={duration}"
+        
+    try:
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("ngrok-skip-browser-warning", "true") 
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        print(f"[Layover API] Error calling {url}: {e}")
+        return None
+
+def post_json(url, data, token=None, timeout=25):
+    """
+    Make a POST request with JSON data.
+    Timeout set to 25 seconds to ensure Lambda doesn't timeout (Lambda timeout is 30s).
+    """
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
+    try:
+        print(f"[HTTP] POST {url} (timeout: {timeout}s)")
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode())
+            print(f"[HTTP] Response received ({response.status})")
+            return result
+    except urllib.error.URLError as e:
+        print(f"[HTTP] URL Error for {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"[HTTP] POST error {url}: {type(e).__name__}: {e}")
+        return None
+
+def get_guest_token():
+    try:
+        data = post_json(f"{BASE_URL}/api/auth/guest-token", {})
+        return data.get("guestToken") if data else None
+    except Exception as e:
+        print("Token fetch error:", e)
+        return None
+
+# ----------------------
+# Flight Shopping
+# ----------------------
+def flight_shopping(token, origin, destination, date, return_date=None):
+    if not token:
+        return []
+
+    origin_code = (origin or "").upper()
+    destination_code = (destination or "").upper()
+
+    print(f"Searching flights: {origin_code} -> {destination_code} on {date}, Return: {return_date}")
+
+    od = [{
+        "departure": {"airportCode": origin_code, "date": date},
+        "arrival": {"airportCode": destination_code},
+    }]
+    
+    if return_date:
+        od.append({
+            "departure": {"airportCode": destination_code, "date": return_date},
+            "arrival": {"airportCode": origin_code},
+        })
+
+    payload = {
+        "originDestinations": od,
+        "travellers": {"adt": 1, "chd": 0, "inf": 0},
+        "preference": {"cabinPreferences": {"cabinType": {"code": "economy"}}},
+    }
+
+    data = post_json(f"{BASE_URL}/api/flight/shopping", payload, token)
+    if not data:
+        print("No data returned from flight shopping API")
+        return None  # Return None to indicate error/timeout vs [] for no flights
+
+    offers_data = data.get("data", {}).get("qrFlights", {}).get("offers", [])
+    print(f"Found {len(offers_data)} offers in response")
+    
+    offers = []
+
+    for offer in offers_data:
+        pricing = offer.get("pricing", {})
+        flight_list = offer.get("flights", [])
+        if not flight_list:
+            continue
+            
+        # First flight (Outbound)
+        outbound = flight_list[0]
+        out_segs = outbound.get("segments", [])
+        if not out_segs:
+            continue
+            
+        first_seg = out_segs[0]
+        last_seg = out_segs[-1]
+        stops = len(out_segs) - 1
+        
+        # Parse departure time
+        departure_str = first_seg.get("departureDateTime", "")
+        departure_dt = None
+        try:
+            val = departure_str.replace("Z", "+00:00") if departure_str else ""
+            departure_dt = datetime.fromisoformat(val) if val else datetime.utcnow()
+        except:
+            departure_dt = datetime.utcnow()
+            
+        offer_id = offer.get("offerId")
+        
+        # Calculate duration in minutes
+        duration_minutes = 0
+        duration_str = outbound.get("duration", "0H0M")
+        try:
+            hours = 0
+            minutes = 0
+            if "H" in duration_str:
+                hours = int(duration_str.split("H")[0].split("PT")[-1])
+            if "M" in duration_str:
+                split_char = "H" if "H" in duration_str else "PT"
+                minutes = int(duration_str.split(split_char)[-1].split("M")[0])
+            duration_minutes = hours * 60 + minutes
+        except:
+            duration_minutes = 9999
+
+        result = {
+            "offerId": offer_id,
+            "airline": first_seg.get("airlineName", "UNKNOWN").strip(),
+            "flightNumber": first_seg.get("flightNumber", ""),
+            "origin": first_seg.get("departureAirportCode", origin_code),
+            "destination": last_seg.get("arrivalAirportCode", destination_code),
+            "departureTime": first_seg.get("departureDateTime"),
+            "arrivalTime": last_seg.get("arrivalDateTime"),
+            "duration": duration_str,
+            "durationMinutes": duration_minutes,
+            "stops": stops,
+            "departureHour": departure_dt.hour,
+            "totalPrice": Decimal(str(pricing.get("total") or 0)),
+            "currency": pricing.get("currency", "USD"),
+            "segments": json.dumps(out_segs),
+            "fetchedAt": datetime.utcnow().isoformat(),
+            "isRoundTrip": len(flight_list) > 1
+        }
+
+        # Second flight (Inbound/Return)
+        if len(flight_list) > 1:
+            inbound = flight_list[1]
+            in_segs = inbound.get("segments", [])
+            if in_segs:
+                i_first = in_segs[0]
+                i_last = in_segs[-1]
+                result["returnFlight"] = {
+                    "airline": i_first.get("airlineName", "UNKNOWN").strip(),
+                    "airlineCode": i_first.get("airlineCode"),
+                    "flightNumber": i_first.get("flightNumber", ""),
+                    "origin": i_first.get("departureAirportCode", destination_code),
+                    "destination": i_last.get("arrivalAirportCode", origin_code),
+                    "departureTime": i_first.get("departureDateTime"),
+                    "arrivalTime": i_last.get("arrivalDateTime"),
+                    "duration": inbound.get("duration", "0H0M"),
+                    "stops": len(in_segs) - 1,
+                    "segments": json.dumps(in_segs)
+                }
+        
+        offers.append(result)
+
+    return offers
+
+# ----------------------
+# LLM Understanding - ENHANCED PROMPT WITH ALL INSTRUCTIONS
+# ----------------------
+def interpret_user_message(user_message, history, available_flights=None, search_params=None):
+    # Filter history to only include 'user' and 'assistant' roles for Bedrock
+    messages = []
+    for m in history:
+        role = m.get("role")
+        if role in ["user", "assistant"]:
+            messages.append({"role": role, "content": [{"text": m["content"]}]})
+            
+    messages.append({"role": "user", "content": [{"text": user_message}]})
+
+    today_date = datetime.utcnow().date()
+    today = today_date.isoformat()
+    tomorrow = (today_date + timedelta(days=1)).isoformat()
+    
+    # Build context dynamically
+    flight_context = ""
+    if available_flights is not None and search_params:
+        flight_context = f"""
+Current search context:
+- origin_iata: {search_params.get('origin')}
+- destination_iata: {search_params.get('destination')}
+- departure_date: {search_params.get('departure_date')}
+- available_flights: {len(available_flights)}
+"""
+
+    # ENHANCED SYSTEM PROMPT WITH COMPLETE INSTRUCTIONS
+    system_prompt = f"""
+CORE IDENTITY & INTERACTION STYLE:
+You are OTA TRAVEL — a world-class, emotionally intelligent AI travel consultant. Your mission is to assist naturally and intelligently, sounding premium, friendly, and human-like.
+
+1. **EMOTIONAL INTELLIGENCE (EI)**:
+   - Detect user's emotion (excited, frustrated, curious) and mirror it gracefully.
+   - Excited: "✨ Awesome choice! Dubai is always exciting!" / Frustrated: "I totally understand that can be frustrating 😔..."
+2. **NATURAL HUMAN FLOW**:
+   - Avoid robotic replies. Mix professional clarity with human warmth.
+   - Keep the 'response' field in your JSON output elegant, short, and concierge-like.
+3. **INTELLIGENT CONCIERGE**:
+   - Show you understand context (city, dates, nationality).
+   - Interpret informal or partial phrasing ("loubrs", "getre").
+   - Match tone with context: ✨ Friendly, 💬 Empathetic, 💡 Smart, 🌍 Inspiring.
+4. **Context Aware & Filter Overrides**: 
+   - Remember and apply ALL previous search details and filters (origin, date, airline, price, stops).
+   - **DYNAMIC FILTERS**: Users can change filters anytime (e.g., "non-stop only", "show fastest"). 
+   - **CRITICAL**: If user provides a contradictory filter (e.g., from "under $200" to "above $200"), **REPLACE** the old filter. Do not stack them.
+   - If user says "any airline" or "different date", clear the respective old criteria.
+   - **AUTOMATIC RANKING**: If the user asks for a superlative ("fastest", "cheapest"), ensure the output reflects this preference in `sort_by` and `result_limit`.
+
+NOTE: The Layover API only checks country-level transit permission (allowed/restricted).
+It does NOT verify individual visa ownership. Handle visa responses logically.
+
+CONVERSATION RESET DETECTION:
+- If the user sends a greeting (hi, hello, hey) or requests a reset (new search, start over), treat this as a FRESH START.
+- Action: Set intent="chat", clear context, respond with welcoming message.
+- Do NOT reference old searches after a reset.
+
+MANDATORY SLOTS TO EXTRACT:
+1. origin: Departure city with IATA code (e.g., 'ADD' for Addis Ababa)
+2. destination: Arrival city with IATA code (e.g., 'DXB' for Dubai)
+3. departure_date: Travel date in YYYY-MM-DD format
+4. trip_type: "one_way" or "round_trip"
+5. passport_nationality: Required ONLY if the user specifies a layover or for long layover safety. Normalize (e.g., "Habesha" -> "Ethiopia").
+6. layover_location: User's preferred transit city/airport (e.g., "Riyadh").
+7. layover_country: **CRITICAL**: Infer the COUNTRY for the layover city. (e.g., "Riyadh" -> "Saudi Arabia", "Dubai" -> "UAE").
+
+ROBUST INPUT HANDLING & GENERALIZATION:
+- **Location Updates**: If the user says "change to X" or "X instead of Y", identify which part (origin or destination) changed. 
+  - Example: Current search DXB -> ADD. User says "change adis to mekele". Mekele becomes the new destination (MQX), Dubai (DXB) remains the origin.
+- **Abbreviations & Local Names**: Handle "Adis" (ADD), "Mekele" (MQX), "Joburg" (JNB), "KL" (KUL). Use your knowledge of major world airports.
+- **Dates**: Interpret relative dates ("next week", "in 5 days", "tomorrow") based on TODAY'S DATE: {today}.
+- **Locations**: Handle abbreviations ("Addis", "Joburg", "KL", "NYC") and infer IATA codes.
+- **Terms**: Map "loubers", "loubrs", "lubs", "lobers" -> **layovers**; "rice", "priz", "pres" -> **price**; "getre", "grtr", "overr" -> **greater/above**; "beloew", "lowerr" -> **below/under**.
+- **Ambiguity**: If user says "London", default to "LON" (All Airports) unless specific.
+- **Complex Filters**: Support multiple filters at once (e.g., "Ethiopian nonstop under $500").
+- **Partial Updates**: If context exists and user says "change to Dubai", update ONLY the destination.
+- **Conceptual Persistence**: If you clarify X and the user answers with Y, check if Y is a correction or a completely new request.
+
+EDGE CASES & TRAPS - HANDLE ALL:
+- **Flights to Mars/Moon/Atlantis**: intent="chat", response: "🌍 I currently only book flights on Earth! Where on our planet would you like to go?"
+- **Past dates**: "I can't book flights in the past. Did you mean [tomorrow's date] or another future date?"
+- **Same city**: "Addis to Addis" -> clarify: "You selected the same origin and destination. Did you mean a different city?"
+- **Contradictions**: "nonstop with 2 stops" -> clarify: "You requested both nonstop and flights with stops. Which do you prefer?"
+- **System commands**: "delete database", "DROP TABLE" -> intent="chat", response: "I am a flight assistant and cannot perform system operations."
+- **Invalid dates**: "February 31st" -> clarify: "That date doesn't exist. Did you mean the last day of the month?"
+- **Negative values**: "under $0", "flights lasting -5 hours" -> clarify: "I need positive values for prices and durations."
+
+SUPERLATIVE & CONTEXT MAINTENANCE - CRITICAL:
+- "The Cheapest" / "The Fastest" / "The Best" -> 
+  - Set `result_limit: 1` to return exactly the single best option.
+  - Set `sort_by` correctly.
+  - **HISTORICAL CONTEXT**: If the user asked "What's the fastest..." in a previous turn and finally provides the dates now, you MUST still apply `result_limit: 1` and `sort_by: "duration"`. Do NOT lose the superlative intent just because it wasn't repeated.
+  - IF searching for first time: `intent="search"`, `next_action="perform_search"`
+  - IF refining previous results: `intent="refine"`, `next_action="apply_filters"`
+- Plural Superlatives ("Fastest flights", "Cheap options") ->
+  - Do NOT set `result_limit`. Return the full list sorted correctly.
+
+FILTER MAPPING - EXTRACT ALL (COMPLETE LIST):
+1. Airline: "Ethiopian only" -> airlines: ["Ethiopian"]
+2. Exclude airline: "No Spirit" -> exclude_airlines: ["Spirit"]
+3. Price max: "Under $500" -> max_price: 500
+4. Price min: "Over $300" -> min_price: 300
+5. Price range: "Between $200-$500" -> min_price: 200, max_price: 500
+6. Stops max: "Nonstop" -> max_stops: 0; "Max 1 stop" -> max_stops: 1; "Stop 1 and 2" -> max_stops: 2
+7. Stops exact: "Exactly 2 stops" -> stops: 2
+8. Departure time: "Morning" -> departure_window: "morning" (5-12); "Afternoon" (12-17); "Evening" (17-22); "Night" (22-5)
+9. Arrival time: "Arrive before noon" -> arrival_before: "12:00"
+10. Layover location (loubers/lobers): "Via Dubai" -> layover_location: "Dubai"
+11. Layover country: "Through Saudi" -> layover_country: "Saudi Arabia"
+12. Exclude layover: "Avoid Doha" -> exclude_layover: ["Doha"]
+13. Layover duration: "Short layover" -> max_layover_minutes: 120; "Long layover" -> min_layover_minutes: 240; "Above 60min" -> min_layover_minutes: 60; "Under 2 hours" -> max_layover_minutes: 120
+14. Cabin class: "Business class" -> cabin_class: "business"
+15. Passengers: "2 adults, 1 child" -> adults: 2, children: 1
+16. Duration max: "Under 5 hours" -> max_duration_hours: 5
+17. Baggage: "Baggage included" -> baggage_included: true
+
+TRANSIT SAFETY PROTOCOL - FIXED (ONE API CALL LOGIC):
+The Layover API only checks if a nationality is ALLOWED or RESTRICTED for a given transit country. It does NOT check visa validity. Do NOT call the API for visa questions.
+
+LOGIC FLOW:
+1️⃣ LAYOVER + NATIONALITY DETECTION
+- If user mentions a layover city or country (e.g., "stay 6 hours in Saudi Arabia") and nationality is unknown:
+    → intent = "clarify", clarification_type = "nationality_for_layover"
+    → response: "To check transit requirements for [layover_country], may I know your passport nationality? 🌍"
+- If nationality is provided and layover_country is known:
+    → Call Layover API ONCE: GET /check?country=[layover_country]&passport=[nationality]
+    → Interpret result:
+        • allowed = true  → proceed normally (search flights)
+        • allowed = false → restricted route → ask visa question.
+
+2️⃣ VISA QUESTION HANDLING (NO API CALLS)
+If API result = restricted → ask: "⚠️ [layover_country] requires a transit visa for [nationality] passport holders. Do you have a valid visa? (Yes/No)"
+
+→ When user replies:
+- If "yes":
+    • Set visa_confirmed = true, search_confirmed = true
+    • Treat route as ALLOWED, Continue directly to flight search (include [layover_country])
+    • Set intent = "search", next_action = "perform_search"
+    • Response: "✅ Great! Since you have a valid visa, I’ll include flights via [layover_country] and show you all available options."
+- If "no":
+    • Set visa_confirmed = false, search_confirmed = true
+    • Remove layover filters (layover_country, layover_location)
+    • Continue directly to flight search (exclude [layover_country])
+    • Set intent = "search", next_action = "perform_search"
+    • Response: "⚠️ Got it! I’ll skip [layover_country] and find visa-free or direct flights instead."
+
+3️⃣ ONLY the first Layover API call should determine restriction. Never call the API again after a visa question.
+4️⃣ CONFIRMATION CONTROL: After the visa question, skip “Is this correct?” confirmation. Go straight to intent="search" and next_action="perform_search". Only confirm trip details once per search session.
+5️⃣ ASK ONCE: Only ask for info that is missing. Do NOT repeat questions for details already provided.
+
+LONG LAYOVER HANDLING (2+ hours):
+- Inform user about layover durations ≥ 2 hours.
+- If nationality unknown, ask for it to check "exit and explore" possibilities.
+
+OUTPUT SCHEMA (JSON ONLY):
+{{
+  "intent": "search|refine|chat|clarify|transit_check",
+  "origin": {{"city": string|null, "iata": string|null}},
+  "destination": {{"city": string|null, "iata": string|null}},
+  "departure_date": string|null,
+  "return_date": string|null,
+  "passport_nationality": string|null,
+  "layover_country": string|null,
+  "filters": {{ ... }},
+  "trip_type": "one_way|round_trip"|null,
+  "result_limit": number|null,
+  "sort_by": "price|duration|departure|stops"|null,
+  "sort_order": "asc|desc"|null,
+  "visa_confirmed": boolean|null,
+  "search_confirmed": boolean|null,
+  "response": "Your natural language response...",
+  "next_action": "perform_search|apply_filters|ask_clarification|continue_chat",
+  "clarification_type": "search_confirmation|missing_origin|missing_destination|missing_date|..."|null
+}}
+
+CONFIRMATION FLOW - MANDATORY:
+- When the mandatory search slots (origin, destination, date, trip_type) are present for the FIRST time, you MUST NOT set `next_action="perform_search"`.
+- **Note**: `passport_nationality` is only mandatory for the first confirmation IF a layover is requested.
+- Instead:
+  - Set `intent="clarify"`, `next_action="ask_clarification"`, `clarification_type="search_confirmation"`
+  - Set `response` to a summary: "I have all the details: [trip_type] from [origin] to [destination] on [date] [with layover info if any]. [Include nationality if known]. ✅ Is this correct?"
+- **EXCEPTION**: If the user just confirmed their visa (responded to the "Do you have a visa?" question with "Yes" or "No"), SKIP this confirmation summary and go straight to `intent="search", next_action="perform_search"`.
+- ONLY when the user says "yes", "correct", "go ahead", or "confirm", set `search_confirmed=true`, `intent="search"`, and `next_action="perform_search"`.
+
+TODAY'S DATE: {today}
+
+{flight_context}
+"""
+
+    try:
+        resp = bedrock.converse(
+            modelId=INFERENCE_PROFILE_ARN,
+            messages=messages,
+            system=[{"text": system_prompt}],
+            inferenceConfig={"temperature": 0.1, "maxTokens": 1000}
+        )
+
+        content = resp["output"]["message"]["content"][0]["text"].strip()
+        
+        # Robust JSON extraction
+        try:
+            start_idx = content.find('{')
+            end_idx = content.rfind('}') + 1
+            if start_idx != -1 and end_idx != 0:
+                json_str = content[start_idx:end_idx]
+                parsed = json.loads(json_str)
+            else:
+                parsed = json.loads(content)
+        except:
+            parsed = json.loads(content)
+
+        print(f"LLM Response: {parsed}")
+        return parsed
+    except Exception as e:
+        print(f"LLM processing error: {e}")
+        return dict(
+            intent="clarify",
+            origin={"city": None, "iata": None},
+            destination={"city": None, "iata": None},
+            departure_date=None,
+            filters={},
+            sort_by=None,
+            sort_order=None,
+            trip_type=None,
+            response="Could you clarify your travel details?",
+            next_action="ask_clarification"
+        )
+
+# ----------------------
+# ENHANCED ASSISTANT MESSAGE GENERATION
+# ----------------------
+def generate_assistant_message(task_payload):
+    system_prompt = """
+You are the Minimalist Luxury Concierge for OTA TRAVEL. You are emotionally intelligent, premium, and human-like.
+
+CORE PERSONALITY & BEHAVIOR:
+1. **EMOTIONAL INTELLIGENCE**: Detect the user's tone and mirror it. Be enthusiastic for excitement, calm and empathetic for frustration.
+2. **NATURAL HUMAN FLOW**: Avoid robotic replies. Speak like a real luxury travel assistant who genuinely cares. Keep sentences short, conversational, and elegant.
+3. **RESPONSE STYLE**: Use short, readable paragraphs. Avoid long walls of text. First sentence: connect emotionally. Middle: helpful action. Last: friendly next step.
+4. **CONCIERGE TONE**: Sound premium, kind, and knowledgeable. Use a few emojis (✈️🌍📅💰⏱️✅⚠️👋) but keep it sophisticated.
+
+TASK PAYLOAD PROVIDED. RESPOND BASED ON TYPE:
+
+1. **SEARCH RESULTS (type="search_results" or type="refine_results")**
+   - **IF count = 1 OR superlative requested (Fastest/Cheapest/Best)**:
+     - Focus entirely on the "Top Pick". "I found the fastest/cheapest flight for you! ✨"
+     - Narrate flight details with an intelligent insight.
+   - **IF count > 1 (General Search)**:
+     - Start with emotional alignment: "I found [count] wonderful options for your journey! ✈️"
+     - **TRAVEL TIPS**: Provide a brief, smart observation about the destination or a helpful travel tip for the route.
+     - Combine price/speed highlights into a conversational paragraph.
+   - **EXCLUDE ROBOTIC FILLER**: Do NOT say "Searching for flights..." or "I am looking...". Start directly with the emotional opening.
+   - Use emojis: ✈️, 💰, ⚡.
+
+3. **NO RESULTS (type="no_results")**
+   - **MANDATORY**: Use natural, proactive language. DO NOT say "It seems that..." or "didn't yield results".
+   - Say: "I couldn't find any flights matching those specific filters. Should we try removing the filters or looking at a different date? I'm ready to search again! 👋"
+   - Suggest the most logical adjustment: "Increasing the budget slightly or trying another carrier might help."
+
+4. **NO RESULTS - RESTRICTED (type="no_results_restricted")**
+   - Explain WHY: "I found flights, but they transit through {restricted_countries} which have restrictions for {nationality} passports."
+   - Ask visa question: "Do you have a valid visa for transit through these countries? (Yes/No)"
+   - Do NOT show restricted flights
+
+5. **TRANSIT ALLOWED (type="transit_allowed")**
+   - Confirm: "✅ Good news! Your {nationality} passport allows visa-free transit through {layover_country}."
+   - Add helpful info: "You can stay airside for up to {hours} hours without a visa."
+
+6. **TRANSIT RESTRICTED (type="transit_restricted")**
+   - Be direct: "⚠️ Transit through {layover_country} requires a visa for {nationality} passport holders."
+   - Ask: "Do you have a valid visa? (Yes/No)"
+
+7. **LONG LAYOVER DETECTED (type="long_layover_detected")**
+   - Proactive: "✈️ I noticed you have a {duration} layover in {airport}. Please share your nationality so I can check if you can exit and explore the city."
+
+8. **SERVICE ERROR (type="service_error")**
+   - Graceful: "The flight search service is temporarily unavailable. Please try again in a moment."
+
+9. **CLARIFY MISSING (type="clarify_missing")**
+   - Specific ask: "I need your {missing_field} to search for flights. Could you provide that?"
+
+10. **GREETING (type="greeting")**
+    - Warm: "👋 Welcome to OTA TRAVEL! I'm your AI flight consultant. Where would you like to fly today?"
+
+11. **SEARCH CONFIRMATION (type="search_confirmation")**
+    - Summary ask: "I have all the details: {trip_type} from {origin} to {destination} on {departure_date} {layover_info}. [IF nationality provided]: You're traveling with a {nationality} passport. ✅ Is this correct?"
+
+FORMATTING RULES:
+- Always use full city names (e.g. Addis Ababa, Dubai); do NOT use IATA codes like ADD or DXB in your message.
+- Use emojis: ✈️🌍📅💰⏱️✅⚠️👋
+- No bolding (do not use **).
+- No bullet points for lists; use simple sentences.
+- Concise but helpful (1-3 sentences typically)
+- Adapt tone to situation
+
+OUTPUT: Return ONLY your natural language response. No JSON, no extra text.
+"""
+
+    try:
+        resp = bedrock.converse(
+            modelId=INFERENCE_PROFILE_ARN,
+            messages=[{"role": "user", "content": [{"text": json.dumps(task_payload)}]}],
+            system=[{"text": system_prompt}],
+            inferenceConfig={"temperature": 0.2, "maxTokens": 300}
+        )
+        return resp["output"]["message"]["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"LLM message error: {e}")
+        return "How can I help with flights today?"
+
+# ----------------------
+# ENHANCED AI FLIGHT SELECTION
+# ----------------------
+def ai_select_flights(offers, user_request, filters=None, sort_by=None, sort_order="asc", result_limit=None, transit_rules=None):
+    """
+    Pure AI-driven flight selection with all filter types.
+    """
+    if not offers:
+        return []
+    
+    # Prepare flight data for LLM
+    flights_summary = []
+    for idx, flight in enumerate(offers):
+        # Parse segments for layover info
+        segments_str = flight.get("segments", "[]")
+        try:
+            segments = json.loads(segments_str) if isinstance(segments_str, str) else segments_str
+        except:
+            segments = []
+        
+        # Calculate layover if multi-stop
+        max_layover_minutes = 0
+        layover_airports = []
+        
+        if len(segments) > 1:
+            for i in range(len(segments) - 1):
+                try:
+                    arr_time = segments[i].get("arrivalDateTime", "")
+                    dep_time = segments[i + 1].get("departureDateTime", "")
+                    if arr_time and dep_time:
+                        arr_dt = datetime.fromisoformat(arr_time.replace("Z", "+00:00"))
+                        dep_dt = datetime.fromisoformat(dep_time.replace("Z", "+00:00"))
+                        layover_mins = (dep_dt - arr_dt).total_seconds() / 60
+                        max_layover_minutes = max(max_layover_minutes, layover_mins)
+                    
+                    stop_code = segments[i].get("arrivalAirport", "")
+                    if stop_code:
+                        layover_airports.append(stop_code)
+                except:
+                    pass
+        
+        # Calculate duration in minutes
+        duration_minutes = 0
+        duration_str = flight.get("duration", "")
+        if duration_str:
+            try:
+                hours = 0
+                minutes = 0
+                if "H" in duration_str:
+                    hours = int(duration_str.split("H")[0].split("PT")[-1])
+                if "M" in duration_str:
+                    split_char = "H" if "H" in duration_str else "PT"
+                    minutes = int(duration_str.split(split_char)[-1].split("M")[0])
+                duration_minutes = hours * 60 + minutes
+            except:
+                duration_minutes = 9999
+
+        flights_summary.append({
+            "index": idx,
+            "airline": str(flight.get("airline", "Unknown")),
+            "price": float(str(flight.get("totalPrice", 0))),
+            "duration": str(flight.get("duration", "")),
+            "durationMinutes": int(duration_minutes),
+            "stops": int(flight.get("stops", 0)),
+            "departureTime": str(flight.get("departureTime", "")),
+            "departureHour": int(flight.get("departureHour", 0)),
+            "layoverMinutes": float(max_layover_minutes) if max_layover_minutes > 0 else None,
+            "layoverAirports": [str(a) for a in layover_airports]
+        })
+    
+    # Build AI selection prompt with complete instructions
+    try:
+        transit_instructions = ""
+        if transit_rules:
+            transit_instructions = f"""
+5. **TRANSIT SAFETY RULES (CRITICAL)**:
+   - Transit rules provided: {json.dumps(transit_rules)}
+   - If a flight transits through a country marked as "allowed": false, EXCLUDE it
+   - Exception: If visa_confirmed = true, ignore restrictions
+"""
+
+        system_prompt = f"""
+You are a flight selection AI. Select flights matching user criteria precisely.
+
+USER REQUEST: "{user_request}"
+
+SELECTION CRITERIA:
+- Filters: {json.dumps(filters) if filters else "None"}
+- Sort by: {sort_by or "None"}
+- Sort order: {sort_order}
+- Result limit: {result_limit or "All matching flights"}
+
+🚨 SELECTION RULES:
+
+1. **UNDERSTAND INTENT**:
+   - Superlative Request (`result_limit: 1`) -> Return EXACTLY ONE index (the absolute best match).
+   - "show flights", "options", "list them" -> Return ALL matching flights.
+   - Specific filters (airline, stops, time) -> Apply filters and return ALL matches.
+
+2. **FILTER APPLICATION**:
+   - Price: Check min_price/max_price against flight.price
+   - Airlines: Match airline name (case-insensitive, allow partial matches e.g. "Ethiopian" matches "Ethiopian Airlines")
+   - Exclude airlines: Remove if airline matches (partial match allowed)
+   - Stops: Compare flight.stops with max_stops
+   - Departure time: Morning(5-12), Afternoon(12-17), Evening(17-22), Night(22-5)
+   - Layover: Check layoverAirports against layover_location
+   - Layover duration: Compare with max_layover_minutes
+   - Cabin class: Match exactly
+
+3. **SUPERLATIVE LOGIC**:
+   - "cheapest": Find minimum price, return ONE index
+   - "fastest": Find minimum durationMinutes, return ONE index
+   - "best": Balance price (40%), duration (30%), stops (30%)
+   - "earliest": Find earliest departure time
+
+4. **TIE-BREAKER**:
+   - Prefer shorter duration
+   - Prefer fewer stops
+   - Prefer better departure time
+
+🚨 **STRICT ENFORCEMENT (CRITICAL)**:
+- If a flight does NOT meet ALL numerical and text filters, YOU MUST EXCLUDE IT.
+- Example: If `max_price` is 300 and flight price is 301.15, EXCLUDE it.
+- Never return "close matches" or "alternatives" in this list if they violate filters.
+- If zero flights match, return `"selected_indices": []`.
+
+{transit_instructions}
+
+AVAILABLE FLIGHTS:
+{json.dumps(flights_summary, indent=2)}
+
+OUTPUT FORMAT (JSON only):
+{{
+  "selected_indices": [3],
+  "reasoning": "Flight 3 is cheapest at $289",
+  "fact_check": {{
+     "count": 1,
+     "cheapest_price": "$289.00",
+     "airline_names": ["Flynas"]
+  }}
+}}
+"""
+        print(f"[AI Selection] Processing {len(offers)} flights")
+        
+        resp = bedrock.converse(
+            modelId=INFERENCE_PROFILE_ARN,
+            messages=[{"role": "user", "content": [{"text": "Select flights matching criteria."}]}],
+            system=[{"text": system_prompt}],
+            inferenceConfig={"temperature": 0.1, "maxTokens": 2000}
+        )
+        
+        response_text = resp["output"]["message"]["content"][0]["text"].strip()
+        
+        # Parse JSON response
+        json_str = None
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0].strip()
+        elif "{" in response_text and "}" in response_text:
+            start = response_text.find("{")
+            end = response_text.rfind("}") + 1
+            json_str = response_text[start:end]
+        else:
+            json_str = response_text
+        
+        if not json_str:
+            raise ValueError("No JSON found")
+        
+        result = json.loads(json_str)
+        selected_indices = result.get("selected_indices", [])
+        
+        # Validate indices
+        valid_indices = [i for i in selected_indices if isinstance(i, int) and 0 <= i < len(offers)]
+        selected_flights = [offers[i] for i in valid_indices]
+        
+        print(f"[AI Selection] Selected {len(selected_flights)} flights")
+        return selected_flights
+        
+    except Exception as e:
+        print(f"[AI Selection] Error: {e}")
+        return offers[:result_limit] if result_limit else offers
+
+# ----------------------
+# Chat Memory Functions
+# ----------------------
+def save_chat(sessionId, role, content):
+    try:
+        chat_table.put_item(Item={
+            "sessionId": sessionId,
+            "timestamp": str(int(time.time() * 1000)),
+            "role": role,
+            "content": content[:4000],
+            "expireAt": int(time.time()) + 7 * 24 * 3600
+        })
+    except Exception as e:
+        print("Chat save error:", e)
+
+def load_chat(sessionId, limit=12):
+    try:
+        resp = chat_table.query(
+            KeyConditionExpression=Key("sessionId").eq(sessionId),
+            ScanIndexForward=False,
+            Limit=limit
+        )
+        items = resp.get("Items", [])
+        return sorted(items, key=lambda x: int(x["timestamp"]))
+    except:
+        return []
+
+def save_session_state(sessionId, search_params):
+    try:
+        chat_table.put_item(Item={
+            "sessionId": sessionId,
+            "timestamp": str(int(time.time() * 1000)),
+            "role": "state",
+            "content": json.dumps(search_params),
+            "expireAt": int(time.time()) + 7 * 24 * 3600
+        })
+    except Exception as e:
+        print("State save error:", e)
+
+def load_session_state(sessionId, limit=25):
+    try:
+        resp = chat_table.query(
+            KeyConditionExpression=Key("sessionId").eq(sessionId),
+            ScanIndexForward=False,
+            Limit=limit
+        )
+        items = resp.get("Items", [])
+        for item in items:
+            if item.get("role") == "state" and item.get("content"):
+                try:
+                    return json.loads(item["content"])
+                except Exception:
+                    return None
+        return None
+    except Exception:
+        return None
+
+def load_offers_by_search_params(search_params):
+    if not search_params:
+        return []
+    origin = (search_params.get("origin") or "").upper()
+    destination = (search_params.get("destination") or "").upper()
+    departure_date = search_params.get("departure_date")
+    if not origin or not destination or not departure_date:
+        return []
+    search_id = f"{origin}-{destination}-{departure_date}"
+    try:
+        resp = flights_table.query(
+            KeyConditionExpression=Key("searchId").eq(search_id),
+            ScanIndexForward=True, 
+            Limit=50
+        )
+        offers = resp.get("Items", [])
+        print(f"[DynamoDB] Loaded {len(offers)} cached offers for {search_id}")
+        return offers
+    except Exception as e:
+        print(f"Load offers error: {e}")
+        return []
+
+# ----------------------
+# JSON Encoder
+# ----------------------
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
+
+# ----------------------
+# Layover Helper Functions
+# ----------------------
+def check_long_layover(segments_data, threshold_hours=2):
+    """
+    Check if any layover in the flight is >= threshold_hours.
+    """
+    try:
+        if isinstance(segments_data, str):
+            segments = json.loads(segments_data)
+        elif isinstance(segments_data, list):
+            segments = segments_data
+        else:
+            return False, []
+        
+        if len(segments) <= 1:
+            return False, []
+        
+        layover_details = []
+        has_long_layover = False
+        
+        for i in range(len(segments) - 1):
+            try:
+                arr_time = segments[i].get("arrivalDateTime", "")
+                dep_time = segments[i + 1].get("departureDateTime", "")
+                
+                if arr_time and dep_time:
+                    arr_dt = datetime.fromisoformat(arr_time.replace("Z", "+00:00"))
+                    dep_dt = datetime.fromisoformat(dep_time.replace("Z", "+00:00"))
+                    layover_mins = (dep_dt - arr_dt).total_seconds() / 60
+                    layover_hours = layover_mins / 60
+                    
+                    airport_code = segments[i].get("arrivalAirportCode") or segments[i].get("arrivalAirport", "")
+                    
+                    hours = int(layover_hours)
+                    mins = int((layover_hours - hours) * 60)
+                    duration_formatted = f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+                    
+                    layover_info = {
+                        'airport': airport_code,
+                        'duration_hours': round(layover_hours, 1),
+                        'duration_formatted': duration_formatted
+                    }
+                    
+                    layover_details.append(layover_info)
+                    
+                    if layover_hours >= threshold_hours:
+                        has_long_layover = True
+            except Exception as e:
+                continue
+        
+        return has_long_layover, layover_details
+    except Exception as e:
+        return False, []
+
+def get_transit_rules_for_offers(offers, nationality):
+    """
+    Fetch transit rules for a batch of offers.
+    """
+    transit_rules = {}
+    restricted_countries = set()
+    
+    if not nationality or not offers:
+        return transit_rules, []
+
+    print(f"[Security] Fetching transit rules for {nationality}...")
+    unique_layover_keys = set()
+    for offer in offers:
+        segments_str = offer.get("segments", "[]")
+        try:
+            segments = json.loads(segments_str) if isinstance(segments_str, str) else segments_str
+        except:
+            segments = []
+            
+        if len(segments) > 1:
+            for i in range(len(segments) - 1):
+                arr_code = segments[i].get("arrivalAirportCode") or segments[i].get("arrivalAirport")
+                if arr_code: 
+                    unique_layover_keys.add(arr_code)
+    
+    for key in unique_layover_keys:
+        # Hardcoded restrictions as fallback
+        if str(key).upper() in ["SA", "SAUDI ARABIA", "RUH", "JED", "DMM"] and str(nationality).lower() in ["kenya", "somalia", "afghanistan"]:
+            transit_rules[key] = {"allowed": False, "reason": "Restricted nationality for Saudi Arabia"}
+            restricted_countries.add("Saudi Arabia")
+        else:
+            res = check_layover_permission(key, nationality)
+            if res:
+                transit_rules[key] = res
+                if not res.get("allowed", True):
+                    restricted_countries.add(res.get("layover_country") or key)
+    
+    return transit_rules, list(restricted_countries)
+
+def check_layover_restriction_only(layover_location, country_inferred, nationality):
+    """
+    Check if a specific layover is restricted.
+    """
+    target_country = country_inferred if country_inferred else layover_location
+    res = check_layover_permission(target_country, nationality, 6.0)
+    
+    if res and not res.get("allowed", True):
+        return True, res
+    return False, None
+
+# ----------------------
+# Main Conversation Handler
+# ----------------------
+def handle_conversation(sessionId, user_message, context=None):
+    """
+    Main conversation handler with complete logic.
+    """
+    # Load conversation history
+    raw_history = load_chat(sessionId)
+    history = [{"role": m["role"], "content": m["content"]} for m in raw_history]
+    
+    # Save user message
+    save_chat(sessionId, "user", user_message)
+    
+    # Load search params from state if context is empty (improves conceptual understanding)
+    search_params = context.get("search_params") if context else None
+    if not search_params:
+        search_params = load_session_state(sessionId)
+        print(f"[Context] Loaded session state from DB: {search_params}")
+
+    # Get LLM understanding
+    llm_response = interpret_user_message(
+        user_message,
+        history,
+        available_flights=context.get("available_flights") if context else None,
+        search_params=search_params
+    )
+    
+    intent = llm_response.get("intent", "chat")
+    response_text = llm_response.get("response", "")
+    next_action = llm_response.get("next_action", "continue_chat")
+    
+    result = {
+        "intent": intent,
+        "message": response_text,
+        "next_action": next_action,
+        "clarification_type": llm_response.get("clarification_type"),
+        "llm_response": llm_response,
+        "visa_confirmed": llm_response.get("visa_confirmed") if llm_response.get("visa_confirmed") is not None else (search_params.get("visa_confirmed") if search_params else None),
+        "search_confirmed": llm_response.get("search_confirmed") if llm_response.get("search_confirmed") is not None else (search_params.get("search_confirmed") if search_params else None)
+    }
+    
+    # Add data based on intent
+    if intent in ["search", "clarify"]:
+        origin_obj = llm_response.get("origin") or {}
+        destination_obj = llm_response.get("destination") or {}
+        
+        # Keep track of everything LLM has extracted so far
+        result.update({
+            "origin": origin_obj.get("city"),
+            "origin_iata": origin_obj.get("iata"),
+            "destination": destination_obj.get("city"),
+            "destination_iata": destination_obj.get("iata"),
+            "departure_date": llm_response.get("departure_date"),
+            "return_date": llm_response.get("return_date"),
+            "trip_type": llm_response.get("trip_type"),
+            "passport_nationality": llm_response.get("passport_nationality"),
+            "filters": llm_response.get("filters") or {},
+            "result_limit": llm_response.get("result_limit")
+        })
+
+        # Persist data to DynamoDB so subsequent turns have context (Dynamic Session State)
+        current_state = {
+            "origin": result.get("origin_iata"),
+            "destination": result.get("destination_iata"),
+            "departure_date": result.get("departure_date"),
+            "return_date": result.get("return_date"),
+            "trip_type": result.get("trip_type"),
+            "passport_nationality": result.get("passport_nationality"),
+            "filters": result.get("filters"),
+            "sort_by": llm_response.get("sort_by"),
+            "sort_order": llm_response.get("sort_order"),
+            "result_limit": result.get("result_limit"),
+            "visa_confirmed": llm_response.get("visa_confirmed"),
+            "search_confirmed": llm_response.get("search_confirmed")
+        }
+        if any(v is not None for v in current_state.values()):
+            save_session_state(sessionId, current_state)
+            print(f"[Context] Persisted state: {current_state}")
+
+        # CONFIRMATION GATE - Only trigger if we think we are done but haven't searched yet
+        if intent == "search":
+            is_confirmed = llm_response.get("search_confirmed", False)
+            
+            # Identify if a layover is specified
+            has_layover = (llm_response.get("layover_country") or 
+                          (llm_response.get("filters") and llm_response.get("filters").get("layover_location")))
+            
+            # Basic slots required for ANY search
+            basic_ready = (result["origin_iata"] and result["destination_iata"] and 
+                           result["departure_date"] and result["trip_type"])
+            
+            # Nationality is only "mandatory" for confirmation if a layover is requested
+            nationality_ready = (result["passport_nationality"] is not None) if has_layover else True
+            
+            all_ready = basic_ready and nationality_ready
+
+            if all_ready and not is_confirmed:
+                result["intent"] = "clarify"
+                result["next_action"] = "ask_clarification"
+                result["clarification_type"] = "search_confirmation"
+                
+                # Get layover info for summary
+                layover_loc = llm_response.get("filters", {}).get("layover_location") or llm_response.get("layover_country")
+                layover_info = f"with a layover in {layover_loc}" if layover_loc else ""
+
+                # Generate the summary message
+                result["message"] = generate_assistant_message({
+                    "type": "search_confirmation",
+                    "origin": result["origin"],
+                    "destination": result["destination"],
+                    "departure_date": result["departure_date"],
+                    "trip_type": result["trip_type"].replace("_", " ") if result["trip_type"] else "one way",
+                    "nationality": result["passport_nationality"] if result["passport_nationality"] else "",
+                    "layover_info": layover_info
+                })
+    elif intent == "refine":
+        result.update({
+            "filters": llm_response.get("filters") or {},
+            "sort_by": llm_response.get("sort_by") or "price",
+            "sort_order": llm_response.get("sort_order") or "asc",
+            "result_limit": llm_response.get("result_limit"),
+            "passport_nationality": llm_response.get("passport_nationality")
+        })
+    elif intent == "chat":
+        save_session_state(sessionId, {})
+        result["search_params"] = {}
+    elif intent == "transit_check":
+        result.update({
+            "passport_nationality": llm_response.get("passport_nationality"),
+            "layover_country": llm_response.get("layover_country")
+        })
+    
+    # Security gate: layover without nationality
+    requested_layover = (llm_response.get("filters") or {}).get("layover_location") or llm_response.get("layover_country")
+    has_nationality = llm_response.get("passport_nationality") or (context and context.get("passport_nationality"))
+    
+    if (intent == "search" or intent == "refine") and requested_layover and not has_nationality:
+        result["intent"] = "clarify"
+        result["next_action"] = "ask_clarification"
+        result["message"] = f"I'd be happy to find flights via {requested_layover}. For your safety, could you tell me your passport nationality first?"
+    
+    return result
+
+# ----------------------
+# Main Lambda Handler
+# ----------------------
+def core_logic(event, context):
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+    }
+
+    # Parse request
+    body = None
+    if isinstance(event, dict):
+        if "body" in event:
+            body = event["body"]
+        elif event.get("message") or event.get("sessionId"):
+            body = event
+
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except json.JSONDecodeError:
+            body = {}
+
+    if not isinstance(body, dict):
+        body = {}
+
+    sessionId = body.get("sessionId", "guest")
+    user_message = body.get("message", "").strip()
+    context = body.get("context", {})
+
+    if not user_message:
+        return {
+            "statusCode": 400,
+            "headers": headers,
+            "body": json.dumps({"error": "Missing message"})
+        }
+
+    # Handle conversation
+    conversation_result = handle_conversation(sessionId, user_message, context)
+    
+    intent = conversation_result["intent"]
+    
+    # TRANSIT CHECK
+    if intent == "transit_check":
+        layover_loc = conversation_result.get("layover_location")
+        layover_country = conversation_result.get("layover_country")
+        nationality = conversation_result.get("passport_nationality")
+        visa_confirmed = conversation_result.get("visa_confirmed", False)
+        
+        if nationality and (layover_loc or layover_country) and not visa_confirmed:
+            is_restricted, rule_details = check_layover_restriction_only(layover_loc, layover_country, nationality)
+            
+            if is_restricted:
+                conversation_result["intent"] = "clarify"
+                conversation_result["next_action"] = "ask_clarification"
+                conversation_result["clarification_type"] = "visa_check"
+                conversation_result["offers"] = []
+                conversation_result["message"] = generate_assistant_message({
+                    "type": "no_results_restricted",
+                    "nationality": nationality,
+                    "requested_layover": layover_loc if layover_loc else layover_country,
+                    "restricted_countries": [rule_details.get("layover_country", "Restricted Country")],
+                    "has_direct_safe_flight": False
+                })
+                intent = "clarify"
+            else:
+                 intent = "search"
+                 conversation_result["next_action"] = "perform_search"
+
+    # SEARCH INTENT
+    if intent == "search" and conversation_result.get("next_action") == "perform_search":
+        origin_iata = conversation_result.get("origin_iata")
+        destination_iata = conversation_result.get("destination_iata")
+        departure_date = conversation_result.get("departure_date")
+
+        if origin_iata and destination_iata and departure_date:
+            token = get_guest_token()
+            if token:
+                offers = flight_shopping(
+                    token, 
+                    origin_iata, 
+                    destination_iata, 
+                    departure_date,
+                    return_date=conversation_result.get("return_date")
+                )
+
+                if offers is None:
+                    conversation_result["offers"] = []
+                    conversation_result["message"] = generate_assistant_message({
+                        "type": "service_error"
+                    })
+                elif offers:
+                    # Get nationality and transit rules
+                    nationality = conversation_result.get("passport_nationality") or context.get("passport_nationality")
+                    visa_confirmed = conversation_result.get("visa_confirmed", False)
+                    
+                    if not visa_confirmed:
+                        transit_rules_for_llm, restricted_countries_list = get_transit_rules_for_offers(offers, nationality)
+                    else:
+                        transit_rules_for_llm = {}
+                        restricted_countries_list = []
+                    
+                    conversation_result["restricted_countries"] = restricted_countries_list
+                    requested_layover = conversation_result.get("filters", {}).get("layover_location") or conversation_result.get("layover_country")
+                    
+                    # Visa override
+                    visa_confirmed = conversation_result.get("visa_confirmed", False)
+                    if visa_confirmed:
+                        restricted_countries_list = []
+                        transit_rules_for_llm = {}
+                    
+                    # Check if layover is safe
+                    layover_was_safe = True
+                    if requested_layover and restricted_countries_list:
+                        for rc in restricted_countries_list:
+                            if requested_layover.lower() in rc.lower() or rc.lower() in requested_layover.lower():
+                                layover_was_safe = False
+                                break
+                    
+                    conversation_result["layover_was_safe"] = layover_was_safe
+
+                    # Save to cache
+                    searchId = f"{origin_iata}-{destination_iata}-{departure_date}"
+                    for offer in offers:
+                        offer["searchId"] = searchId
+                        try:
+                            flights_table.put_item(Item=offer)
+                        except Exception as e:
+                            print(f"Error saving offer: {e}")
+
+                    # Get filters
+                    filters = conversation_result.get("filters") or {}
+                    sort_by = conversation_result.get("sort_by") or None
+                    sort_order = conversation_result.get("sort_order") or "asc"
+                    result_limit = conversation_result.get("result_limit")
+                    
+                    # AI selection
+                    ai_input_offers = offers
+                    if len(offers) > 25:
+                        ai_input_offers = sorted(offers, key=lambda x: float(str(x.get("totalPrice", 999999))))[:25]
+
+                    offers_final = ai_select_flights(
+                        ai_input_offers, 
+                        user_message,
+                        filters=filters,
+                        sort_by=sort_by,
+                        sort_order=sort_order,
+                        result_limit=result_limit,
+                        transit_rules=transit_rules_for_llm
+                    )
+                    
+                    conversation_result["offers"] = offers_final
+                    conversation_result["total_offers"] = len(offers)
+                    conversation_result["search_params"] = {
+                        "origin": origin_iata,
+                        "destination": destination_iata,
+                        "departure_date": departure_date,
+                        "return_date": conversation_result.get("return_date"),
+                        "passport_nationality": nationality
+                    }
+                    save_session_state(sessionId, conversation_result["search_params"])
+
+                    # Check for long layovers
+                    long_layover_info = []
+                    if offers_final and not nationality:
+                        for offer in offers_final:
+                            has_long, layover_details = check_long_layover(offer.get("segments", "[]"))
+                            if has_long:
+                                for detail in layover_details:
+                                    if detail['duration_hours'] >= 2:
+                                        long_layover_info.append(detail)
+                    
+                    if long_layover_info and not nationality:
+                        conversation_result["intent"] = "clarify"
+                        conversation_result["next_action"] = "ask_clarification"
+                        conversation_result["clarification_type"] = "long_layover_nationality"
+                        conversation_result["long_layover_details"] = long_layover_info
+                        conversation_result["message"] = generate_assistant_message({
+                            "type": "long_layover_detected",
+                            "layovers": long_layover_info
+                        })
+                    else:
+                        # Security gate for restricted layover
+                        is_restricted = not conversation_result.get("layover_was_safe", True)
+                        if is_restricted and not visa_confirmed:
+                             conversation_result["offers"] = []
+                             conversation_result["intent"] = "clarify"
+                             conversation_result["next_action"] = "ask_clarification"
+                             conversation_result["clarification_type"] = "restricted_layover"
+                             conversation_result["message"] = generate_assistant_message({
+                                "type": "no_results_restricted",
+                                "origin_iata": origin_iata,
+                                "destination_iata": destination_iata,
+                                "departure_date": departure_date,
+                                "nationality": nationality,
+                                "requested_layover": requested_layover,
+                                "restricted_countries": conversation_result.get("restricted_countries", []),
+                                "has_direct_safe_flight": False
+                            })
+                        else:
+                            # Enhanced Search Intelligence for Narration
+                            all_offers = conversation_result.get("offers", [])
+                            insights = {
+                                "cheapest": {},
+                                "fastest": {},
+                                "stops_count": {"direct": 0, "1-stop": 0, "2-stop": 0, "3+": 0}
+                            }
+                            
+                            if all_offers:
+                                # Cheapest
+                                cheapest = min(all_offers, key=lambda x: float(x.get("totalPrice", 999999)))
+                                insights["cheapest"] = {
+                                    "airline": cheapest.get("airline"),
+                                    "price": float(cheapest.get("totalPrice")),
+                                    "duration": cheapest.get("duration")
+                                }
+                                
+                                # Fastest
+                                fastest = min(all_offers, key=lambda x: x.get("durationMinutes", 9999))
+                                insights["fastest"] = {
+                                    "airline": fastest.get("airline"),
+                                    "duration": fastest.get("duration")
+                                }
+                                
+                                # Stops Summary
+                                for off in all_offers:
+                                    s = off.get("stops", 0)
+                                    if s == 0: insights["stops_count"]["direct"] += 1
+                                    elif s == 1: insights["stops_count"]["1-stop"] += 1
+                                    elif s == 2: insights["stops_count"]["2-stop"] += 1
+                                    else: insights["stops_count"]["3+"] += 1
+
+                            conversation_result["message"] = generate_assistant_message({
+                                "type": "search_results",
+                                "origin_iata": origin_iata,
+                                "destination_iata": destination_iata,
+                                "departure_date": departure_date,
+                                "total_offers": len(offers),
+                                "returned_offers": len(conversation_result["offers"]),
+                                "filters": conversation_result.get("filters"),
+                                "trip_type": conversation_result.get("trip_type"),
+                                "nationality": nationality,
+                                "restricted_countries": conversation_result.get("restricted_countries", []),
+                                "insights": insights
+                            })
+                else:
+                    conversation_result["offers"] = []
+                    conversation_result["message"] = generate_assistant_message({
+                        "type": "no_results",
+                        "origin_iata": origin_iata,
+                        "destination_iata": destination_iata,
+                        "departure_date": departure_date
+                    })
+            else:
+                conversation_result["message"] = generate_assistant_message({
+                    "type": "service_error"
+                })
+        else:
+            conversation_result["intent"] = "clarify"
+            conversation_result["next_action"] = "ask_clarification"
+            conversation_result["message"] = generate_assistant_message({
+                "type": "clarify_missing",
+                "message": "I need more information to search for flights."
+            })
+    
+    # REFINE INTENT
+    elif intent == "refine" and conversation_result.get("next_action") == "apply_filters":
+        current_offers = context.get("available_flights", [])
+        if not current_offers:
+            search_params = context.get("search_params") if context else None
+            if not search_params:
+                search_params = load_session_state(sessionId)
+            current_offers = load_offers_by_search_params(search_params)
+
+        if current_offers:
+            filters = conversation_result.get("filters", {})
+            sort_by = conversation_result.get("sort_by", "price")
+            sort_order = conversation_result.get("sort_order", "asc")
+            result_limit = conversation_result.get("result_limit")
+            
+            ai_input_offers = current_offers
+            if len(current_offers) > 60:
+                ai_input_offers = sorted(current_offers, key=lambda x: float(str(x.get("totalPrice", 999999))))[:60]
+
+            # Get nationality for transit rules
+            nationality = conversation_result.get("passport_nationality")
+            if not nationality and context:
+                nationality = context.get("search_params", {}).get("passport_nationality")
+            if not nationality:
+                sp = load_session_state(sessionId)
+                if sp: nationality = sp.get("passport_nationality")
+            
+            visa_confirmed = conversation_result.get("visa_confirmed", False)
+            if not visa_confirmed:
+                transit_rules_for_llm, restricted_countries_list = get_transit_rules_for_offers(ai_input_offers, nationality)
+            else:
+                transit_rules_for_llm = {}
+                restricted_countries_list = []
+                
+            conversation_result["restricted_countries"] = restricted_countries_list
+
+            # AI selection
+            filtered_offers = ai_select_flights(
+                ai_input_offers,
+                user_message,
+                filters=filters,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                result_limit=result_limit,
+                transit_rules=transit_rules_for_llm
+            )
+            
+            conversation_result["offers"] = filtered_offers
+            conversation_result["total_offers"] = len(filtered_offers)
+            conversation_result["applied_filters"] = filters
+
+            search_params = context.get("search_params") or load_session_state(sessionId)
+            if search_params:
+                conversation_result["search_params"] = search_params
+
+            # Enhanced Search Intelligence for Narration
+            insights = {
+                "cheapest": {},
+                "fastest": {},
+                "stops_count": {"direct": 0, "1-stop": 0, "2-stop": 0, "3+": 0}
+            }
+            
+            if filtered_offers:
+                # Cheapest
+                cheapest = min(filtered_offers, key=lambda x: float(x.get("totalPrice", 999999)))
+                insights["cheapest"] = {
+                    "airline": cheapest.get("airline"),
+                    "price": float(cheapest.get("totalPrice")),
+                    "duration": cheapest.get("duration")
+                }
+                
+                # Fastest
+                fastest = min(filtered_offers, key=lambda x: x.get("durationMinutes", 9999))
+                insights["fastest"] = {
+                    "airline": fastest.get("airline"),
+                    "duration": fastest.get("duration")
+                }
+                
+                # Stops Summary
+                for off in filtered_offers:
+                    s = off.get("stops", 0)
+                    if s == 0: insights["stops_count"]["direct"] += 1
+                    elif s == 1: insights["stops_count"]["1-stop"] += 1
+                    elif s == 2: insights["stops_count"]["2-stop"] += 1
+                    else: insights["stops_count"]["3+"] += 1
+
+            # Generate response
+            if filtered_offers:
+                narrative_payload = {
+                    "type": "refine_results",
+                    "count": len(filtered_offers),
+                    "filters": filters,
+                    "insights": insights
+                }
+            else:
+                narrative_payload = {
+                    "type": "no_results",
+                    "filters": filters
+                }
+
+            conversation_result["message"] = generate_assistant_message(narrative_payload)
+    
+    # TRANSIT CHECK INTENT
+    elif intent == "transit_check":
+        nationality = conversation_result.get("passport_nationality")
+        country = conversation_result.get("layover_country")
+        
+        if nationality and country:
+            rules = check_layover_permission(country, nationality)
+            if rules:
+                is_allowed = rules.get("allowed", False)
+                narrative_payload = {
+                    "type": "transit_allowed" if is_allowed else "transit_restricted",
+                    "layover_country": country,
+                    "nationality": nationality,
+                    "notes": rules.get("notes", ""),
+                    "message": rules.get("message", "")
+                }
+                conversation_result["transit_rules"] = rules
+                conversation_result["message"] = generate_assistant_message(narrative_payload)
+            else:
+                conversation_result["message"] = "I'm having trouble connecting to the transit database. Please try again."
+        else:
+            conversation_result["message"] = "I need both the layover country and your nationality to check transit safety."
+    
+    # Save assistant response
+    if conversation_result.get("message"):
+        save_chat(sessionId, "assistant", conversation_result["message"])
+
+    return {
+        "statusCode": 200,
+        "headers": headers,
+        "body": json.dumps(conversation_result, cls=DecimalEncoder)
+    }
+
+# ----------------------
+# Lambda Handler with Error Wrapper
+# ----------------------
+def lambda_handler(event, context):
+    try:
+        return core_logic(event, context)
+    except Exception as e:
+        print(f"CRITICAL LAMBDA ERROR: {e}")
+        traceback.print_exc()
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST,OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type"
+        }
+        
+        # Graceful error message
+        error_message = "I encountered a momentary glitch. Please try your request again. I'm here to help!"
+        
+        return {
+            "statusCode": 200,
+            "headers": headers,
+            "body": json.dumps({
+                "message": error_message,
+                "intent": "chat",
+                "response": error_message
+            })
+        }
